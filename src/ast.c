@@ -64,7 +64,7 @@ value_t fl_invoke_julia_macro(value_t *args, uint32_t nargs)
 {
     if (nargs < 1)
         argcount("invoke-julia-macro", nargs, 1);
-    jl_function_t *f = NULL;
+    jl_lambda_info_t *f = NULL;
     jl_value_t **margs;
     JL_GC_PUSHARGS(margs, nargs);
     int i;
@@ -73,9 +73,10 @@ value_t fl_invoke_julia_macro(value_t *args, uint32_t nargs)
 
     JL_TRY {
         margs[0] = scm_to_julia(args[0], 1);
-        f = (jl_function_t*)jl_toplevel_eval(margs[0]);
-        assert(jl_is_func(f));
-        result = jl_apply(f, &margs[1], nargs-1);
+        f = (jl_lambda_info_t*)jl_toplevel_eval(margs[0]);
+        assert(jl_is_lambda_info(f));
+        // TODO jb/functions: macro func should have self argument prepended
+        result = jl_call_method_internal(f, &margs[1], nargs>1 ? nargs-1 : 1);
     }
     JL_CATCH {
         JL_GC_POP();
@@ -94,10 +95,10 @@ value_t fl_invoke_julia_macro(value_t *args, uint32_t nargs)
     fl_gc_handle(&scm);
     value_t scmresult;
     jl_module_t *defmod;
-    if (jl_is_gf(f))
-        defmod = jl_gf_mtable(f)->module;
+    if (jl_is_lambda_info(f))
+        defmod = f->module;
     else
-        defmod = f->linfo->module;
+        defmod = jl_gf_mtable(f)->module;
     if (defmod == NULL || defmod == jl_current_module) {
         scmresult = fl_cons(scm, FL_F);
     }
@@ -718,17 +719,6 @@ jl_array_t *jl_lam_vinfo(jl_expr_t *l)
     return (jl_array_t*)ll;
 }
 
-// get array of var info records for captured vars
-jl_array_t *jl_lam_capt(jl_expr_t *l)
-{
-    assert(jl_is_expr(l));
-    jl_value_t *le = jl_exprarg(l, 1);
-    assert(jl_is_array(le));
-    jl_value_t *ll = jl_cellref(le, 1);
-    assert(jl_is_array(ll));
-    return (jl_array_t*)ll;
-}
-
 // get array of types for GenSym vars, or its length (if not type-inferred)
 jl_value_t *jl_lam_gensyms(jl_expr_t *l)
 {
@@ -748,16 +738,6 @@ jl_array_t *jl_lam_staticparams(jl_expr_t *l)
     assert(jl_array_len(le) == 4);
     assert(jl_is_array(jl_cellref(le, 3)));
     return (jl_array_t*)jl_cellref(le, 3);
-}
-
-int jl_lam_vars_captured(jl_expr_t *ast)
-{
-    jl_array_t *vinfos = jl_lam_vinfo(ast);
-    for(int i=0; i < jl_array_len(vinfos); i++) {
-        if (jl_vinfo_capt((jl_array_t*)jl_cellref(vinfos,i)))
-            return 1;
-    }
-    return 0;
 }
 
 // get array of body forms
@@ -984,7 +964,6 @@ DLLEXPORT jl_value_t *jl_prepare_ast(jl_lambda_info_t *li, jl_svec_t *sparams)
     JL_TRY {
         jl_current_module = li->module;
         eval_decl_types(jl_lam_vinfo((jl_expr_t*)ast), ast, spenv);
-        eval_decl_types(jl_lam_capt((jl_expr_t*)ast), ast, spenv);
     }
     JL_CATCH {
         jl_current_module = last_m;
@@ -1037,7 +1016,6 @@ int jl_in_sym_array(jl_array_t *a, jl_sym_t *v)
 int jl_local_in_ast(jl_expr_t *ast, jl_sym_t *sym)
 {
     return jl_in_vinfo_array(jl_lam_vinfo(ast), sym) ||
-        jl_in_vinfo_array(jl_lam_capt(ast), sym) ||
         jl_in_sym_array(jl_lam_staticparams(ast), sym);
 }
 
@@ -1065,6 +1043,8 @@ static jl_value_t *resolve_globals(jl_value_t *expr, jl_lambda_info_t *lam)
                  e->head == line_sym || e->head == meta_sym) {
         }
         else {
+            // TODO jb/functions
+            /*
             if (e->head == call_sym && jl_expr_nargs(e) == 3 && jl_is_quotenode(jl_exprarg(e,2)) &&
                 lam->module != NULL) {
                 // replace getfield(module_expr, :sym) with GlobalRef
@@ -1085,6 +1065,7 @@ static jl_value_t *resolve_globals(jl_value_t *expr, jl_lambda_info_t *lam)
                     }
                 }
             }
+            */
             size_t i = 0;
             if (e->head == method_sym || e->head == abstracttype_sym || e->head == compositetype_sym ||
                 e->head == bitstype_sym || e->head == macro_sym || e->head == module_sym)

@@ -13,7 +13,6 @@ const NF = NotFound()
 
 type StaticVarInfo
     sp::SimpleVector     # static parameters
-    cenv::ObjectIdDict   # types of closed vars
     vars::Array{Any,1}   # names of args and locals
     gensym_types::Array{Any,1} # types of the GenSym's in this function
     vinfo::Array{Any,1}  # variable properties
@@ -65,17 +64,7 @@ end
 
 is_local(sv::StaticVarInfo, s::GenSym) = true
 is_local(sv::StaticVarInfo, s::Symbol) = contains_is(sv.vars, s)
-is_closed(sv::StaticVarInfo, s::Symbol) = haskey(sv.cenv, s)
-function is_assigned_inner(sv::StaticVarInfo, s::Symbol)
-    for vi in sv.vinfo
-        if vi[1] === s
-            return (vi[3]&4) != 0
-        end
-    end
-    return false
-end
-is_global(sv::StaticVarInfo, s::Symbol) =
-    !is_local(sv,s) && !is_closed(sv,s) && !is_static_parameter(sv,s)
+is_global(sv::StaticVarInfo, s::Symbol) = !is_local(sv,s) && !is_static_parameter(sv,s)
 
 function _iisconst(s::Symbol)
     m = (inference_stack::CallStack).mod
@@ -557,16 +546,19 @@ function isconstantfunc(f::ANY, sv::StaticVarInfo)
         end
     end
 
-    if isa(f,QuoteNode) && (isa(f.value, Function) || isa(f.value, IntrinsicFunction))
+    if isa(f,QuoteNode)
         return f.value
-    end
-    if isa(f,Function) || isa(f,IntrinsicFunction)
-        return f
-    end
-    if isa(f,SymbolNode)
+    elseif isa(f,GenSym)
+        return false
+    elseif isa(f,SymbolNode)
         f = f.name
     end
-    return isa(f,Symbol) && is_global(sv, f) && _iisconst(f) && f
+    if isa(f,Symbol)
+        return is_global(sv, f) && _iisconst(f) && f
+    elseif !isa(f,Expr)
+        return f
+    end
+    return false
 end
 
 const isconstantref = isconstantfunc
@@ -608,9 +600,9 @@ let stagedcache=Dict{Any,Any}()
     global func_for_method
     function func_for_method(m::Method, tt, env)
         if !m.isstaged
-            return m.func.code
+            return m.func
         elseif haskey(stagedcache,(m,tt,env))
-            return stagedcache[(m,tt,env)].code
+            return stagedcache[(m,tt,env)]
         else
             if !isleaftype(tt)
                 # don't call staged functions on abstract types.
@@ -620,12 +612,12 @@ let stagedcache=Dict{Any,Any}()
             end
             f = ccall(:jl_instantiate_staged,Any,(Any,Any,Any),m,tt,env)
             stagedcache[(m,tt,env)] = f
-            return f.code
+            return f
         end
     end
 end
 
-function abstract_call_gf(f, fargs, argtype, e)
+function abstract_call_gf(f::ANY, fargs, argtype::ANY, e)
     argtypes = argtype.parameters
     tm = _topmod()
     if length(argtypes)>1 && argtypes[2]===Int && (argtypes[1] <: Tuple ||
@@ -689,9 +681,10 @@ function abstract_call_gf(f, fargs, argtype, e)
         return Any
     end
     for (m::SimpleVector) in x
+        sig = m[1]
         local linfo
         linfo = try
-            func_for_method(m[3],argtype,m[2])
+            func_for_method(m[3],sig,m[2])
         catch
             NF
         end
@@ -700,7 +693,6 @@ function abstract_call_gf(f, fargs, argtype, e)
             break
         end
         linfo = linfo::LambdaStaticData
-        sig = m[1]
         lsig = length(m[3].sig.parameters)
         # limit argument type tuple based on size of definition signature.
         # for example, given function f(T, Any...), limit to 3 arguments
@@ -745,12 +737,15 @@ function abstract_call_gf(f, fargs, argtype, e)
     return rettype
 end
 
-function invoke_tfunc(f, types, argtype)
+function invoke_tfunc(f::ANY, types::ANY, argtype::ANY)
     argtype = typeintersect(types,limit_tuple_type(argtype))
     if is(argtype,Bottom)
         return Bottom
     end
-    meth = ccall(:jl_gf_invoke_lookup, Any, (Any, Any), f, types)
+    ft = isa(f,Type) ? Type{f} : typeof(f)
+    types = Tuple{ft, types.parameters...}
+    argtype = Tuple{ft, argtype.parameters...}
+    meth = ccall(:jl_gf_invoke_lookup, Any, (Any,), types)
     if is(meth, nothing)
         return Any
     end
@@ -795,7 +790,7 @@ function precise_container_types(args, types, vtypes, sv)
 end
 
 # do apply(af, fargs...), where af is a function value
-function abstract_apply(af, fargs, aargtypes::Vector{Any}, vtypes, sv, e)
+function abstract_apply(af::ANY, fargs, aargtypes::Vector{Any}, vtypes, sv, e)
     ctypes = precise_container_types(fargs, aargtypes, vtypes, sv)
     if ctypes !== nothing
         # apply with known func with known tuple types
@@ -813,28 +808,14 @@ function abstract_apply(af, fargs, aargtypes::Vector{Any}, vtypes, sv, e)
     return abstract_call(af, (), Any[Vararg{Any}], vtypes, sv, ())
 end
 
-function abstract_call(f, fargs, argtypes::Vector{Any}, vtypes, sv::StaticVarInfo, e)
-    if is(f,_apply) && length(fargs)>1
-        af = isconstantfunc(fargs[2], sv)
+function abstract_call(f::ANY, fargs, argtypes::Vector{Any}, vtypes, sv::StaticVarInfo, e)
+    if is(f,_apply) && length(fargs)>0
+        af = isconstantfunc(fargs[1], sv)
         if !is(af,false)
             af = _ieval(af)
-            if isa(af,Function)
-                return abstract_apply(af, fargs[3:end], argtypes[3:end], vtypes, sv, e)
-            end
+            return abstract_apply(af, fargs[2:end], argtypes[2:end], vtypes, sv, e)
         end
-        # TODO: this slows down inference a lot
-        a2type = argtypes[2]
-        if a2type !== Function && isleaftype(a2type)
-            # would definitely use call()
-            call_func = _ieval(isconstantfunc(fargs[1], sv))
-            if isa(call_func,Function)
-                aargtypes = Any[ argtypes[i] for i=2:length(argtypes) ]
-                aargtypes[1] = Tuple{aargtypes[1]}  # don't splat "function"
-                fa = fargs[2:end]
-                fa[1] = Expr(:call, top_tuple, fa[1])
-                return abstract_apply(call_func, fa, aargtypes, vtypes, sv, e)
-            end
-        end
+        # TODO jb/functions: take advantage of case where non-constant `af`'s type is known
         return Any
     end
     for i=1:(length(argtypes)-1)
@@ -842,12 +823,10 @@ function abstract_call(f, fargs, argtypes::Vector{Any}, vtypes, sv::StaticVarInf
             return Any
         end
     end
-    if isgeneric(f)
-        return abstract_call_gf(f, fargs, Tuple{argtypes...}, e)
-    end
     if is(f,invoke) && length(fargs)>1
         af = isconstantfunc(fargs[1], sv)
-        if !is(af,false) && (af=_ieval(af);isgeneric(af))
+        if !is(af,false)
+            af = _ieval(af)
             sig = argtypes[2]
             if isType(sig) && sig.parameters[1] <: Tuple
                 return invoke_tfunc(af, sig.parameters[1], Tuple{argtypes[3:end]...})
@@ -861,42 +840,29 @@ function abstract_call(f, fargs, argtypes::Vector{Any}, vtypes, sv::StaticVarInf
         end
     end
     if is(f,kwcall)
-        if length(argtypes) < 4
+        if length(argtypes) < 3
             return Bottom
         end
         if length(fargs) < 3
             return Any
         end
-        kwcount = fargs[2]
-        ff = isconstantfunc(fargs[3 + 2*kwcount], sv)
+        kwcount = fargs[1]
+        ff = isconstantfunc(fargs[2 + 2*kwcount], sv)
         if !(ff===false)
-            ff = _ieval(ff)
-            if isgeneric(ff) && isdefined(ff.env,:kwsorter)
-                # use the fact that kwcall(...) calls ff.env.kwsorter
-                posargt = argtypes[(5+2*kwcount):end]
-                return abstract_call_gf(ff.env.kwsorter, (),
+            ff = _ieval(ff); mt = typeof(ff).name.mt
+            if isdefined(mt, :kwsorter)
+                # use the fact that kwcall(...) calls mt.kwsorter
+                posargt = argtypes[(3+2*kwcount):end]
+                return abstract_call_gf(mt.kwsorter, (),
                                         Tuple{Array{Any,1}, posargt...}, e)
             end
         end
-        # TODO: call() case
         return Any
     end
-    if !isa(f,Function) && !isa(f,IntrinsicFunction)
-        if !_iisdefined(:call)
-            return Any
-        end
-        call_func = _ieval(:call)
-        if isa(call_func,Function)
-            return abstract_call(call_func, e.args,
-                                 Any[abstract_eval_constant(f),argtypes...],
-                                 vtypes, sv, e)
-        else
-            return Any
-        end
+    if isa(f,Builtin) || isa(f,IntrinsicFunction)
+        return builtin_tfunction(f, fargs, Tuple{argtypes...})
     end
-    rt = builtin_tfunction(f, fargs, Tuple{argtypes...})
-    #print("=> ", rt, "\n")
-    return rt
+    return abstract_call_gf(f, fargs, Tuple{argtypes...}, e)
 end
 
 function abstract_eval_call(e, vtypes, sv::StaticVarInfo)
@@ -908,18 +874,8 @@ function abstract_eval_call(e, vtypes, sv::StaticVarInfo)
     called = e.args[1]
     func = isconstantfunc(called, sv)
     if is(func,false)
-        if isa(called, LambdaStaticData)
-            # called lambda expression (let)
-            (_, result) = typeinf(called, Tuple{argtypes...}, called.sparams, called)
-            return result
-        end
         ft = abstract_eval(called, vtypes, sv)
-        if !(Function <: ft) && _iisdefined(:call)
-            call_func = _ieval(:call)
-            if isa(call_func,Function)
-                return abstract_call(call_func, e.args, Any[ft,argtypes...], vtypes, sv, e)
-            end
-        end
+        # TODO jb/functions: take advantage of case where a non-constant function's type is known
         return Any
     end
     #print("call ", e.args[1], argtypes, "\n\n")
@@ -943,8 +899,6 @@ function abstract_eval(e::ANY, vtypes, sv::StaticVarInfo)
         return abstract_eval_symbol((e::SymbolNode).name, vtypes, sv)
     elseif isa(e,GenSym)
         return abstract_eval_gensym(e::GenSym, sv)
-    elseif isa(e,LambdaStaticData)
-        return Function
     elseif isa(e,GlobalRef)
         return abstract_eval_global(e.mod, e.name)
     end
@@ -1052,10 +1006,6 @@ function abstract_eval_gensym(s::GenSym, sv::StaticVarInfo)
 end
 
 function abstract_eval_symbol(s::Symbol, vtypes::ObjectIdDict, sv::StaticVarInfo)
-    if haskey(sv.cenv,s)
-        # consider closed vars to always have their propagated (declared) type
-        return sv.cenv[s]
-    end
     t = get(vtypes,s,NF)
     if is(t,NF)
         sp = sv.sp
@@ -1121,7 +1071,8 @@ function abstract_interpret(e::ANY, vtypes, sv::StaticVarInfo)
     elseif is(e.head,:method)
         fname = e.args[1]
         if isa(fname,Symbol)
-            return StateUpdate(fname, VarState(Function,false), vtypes)
+            # TODO jb/functions
+            return StateUpdate(fname, VarState(Any,false), vtypes)
         end
     end
     return vtypes
@@ -1492,32 +1443,11 @@ function typeinf_uncached(linfo::LambdaStaticData, atypes::ANY, sparams::SimpleV
         @assert la == 0
     end
 
-    # types of closed vars
-    cenv = ObjectIdDict()
-    for vi in (ast.args[2][2])::Array{Any,1}
-        vi::Array{Any,1}
-        vname = vi[1]
-        vtype = vi[2]
-        cenv[vname] = vtype
-        s[1][vname] = VarState(vtype,false)
-    end
-    for vi in vinflist
-        vi::Array{Any,1}
-        if (vi[3]&4)!=0
-            # variables assigned by inner functions are treated like
-            # closed variables; we only use the declared type
-            vname = vi[1]
-            vtype = vi[2]
-            cenv[vname] = vtype
-            s[1][vname] = VarState(vtype,false)
-        end
-    end
-
     gensym_uses = find_gensym_uses(body)
     gensym_init = Any[ NF for i = 1:length(gensym_uses) ]
     gensym_types = copy(gensym_init)
 
-    sv = StaticVarInfo(sparams, cenv, vars, gensym_types, vinflist, length(labels), ObjectIdDict())
+    sv = StaticVarInfo(sparams, vars, gensym_types, vinflist, length(labels), ObjectIdDict())
     frame.sv = sv
 
     recpts = IntSet()  # statements that depend recursively on our value
@@ -1723,11 +1653,11 @@ function record_var_type(e::Symbol, t::ANY, decls)
     end
 end
 
-function eval_annotate(e::ANY, vtypes::ANY, sv::StaticVarInfo, decls, clo, undefs)
+function eval_annotate(e::ANY, vtypes::ANY, sv::StaticVarInfo, decls, undefs)
     if isa(e, Symbol)
         e = e::Symbol
 
-        if !is_local(sv, e) && !is_closed(sv, e)
+        if !is_local(sv, e)
             # can get types of globals and static params from the environment
             return e
         end
@@ -1755,11 +1685,6 @@ function eval_annotate(e::ANY, vtypes::ANY, sv::StaticVarInfo, decls, clo, undef
         return e
     end
 
-    if isa(e, LambdaStaticData)
-        push!(clo, e)
-        return e
-    end
-
     if !isa(e,Expr)
         return e
     end
@@ -1779,7 +1704,7 @@ function eval_annotate(e::ANY, vtypes::ANY, sv::StaticVarInfo, decls, clo, undef
             # we don't use types on assignment LHS
             s = s.name
         end
-        e.args[2] = eval_annotate(e.args[2], vtypes, sv, decls, clo, undefs)
+        e.args[2] = eval_annotate(e.args[2], vtypes, sv, decls, undefs)
         if isa(s,Symbol)
             # TODO: if this def does not reach any uses, maybe don't do this
             rhstype = exprtype(e.args[2], sv)
@@ -1793,16 +1718,8 @@ function eval_annotate(e::ANY, vtypes::ANY, sv::StaticVarInfo, decls, clo, undef
     for i=i0:length(e.args)
         subex = e.args[i]
         if !(isa(subex,Number) || isa(subex,AbstractString))
-            e.args[i] = eval_annotate(subex, vtypes, sv, decls, clo, undefs)
+            e.args[i] = eval_annotate(subex, vtypes, sv, decls, undefs)
         end
-    end
-    if head === :call && isa(e.args[1],LambdaStaticData)
-        called = e.args[1]
-        fargs = e.args[2:end]
-        argtypes = Tuple{[abstract_eval(a, vtypes, sv) for a in fargs]...}
-        # recur inside inner functions once we have all types
-        tr,ty = typeinf(called, argtypes, called.sparams, called, false, true)
-        called.ast = tr
     end
     return e
 end
@@ -1815,13 +1732,12 @@ function type_annotate(ast::Expr, states::Array{Any,1}, sv::ANY, rettype::ANY, a
     for arg in args
         decls[arg] = states[1][arg].typ
     end
-    closures = []
     body = ast.args[3].args::Array{Any,1}
     for i=1:length(body)
         st_i = states[i]
         if st_i !== ()
             # st_i === ()  =>  unreached statement  (see issue #7836)
-            body[i] = eval_annotate(body[i], st_i, sv, decls, closures, undefs)
+            body[i] = eval_annotate(body[i], st_i, sv, decls, undefs)
         end
     end
     ast.args[3].typ = rettype
@@ -1844,26 +1760,6 @@ function type_annotate(ast::Expr, states::Array{Any,1}, sv::ANY, rettype::ANY, a
         end
     end
     ast.args[2][3] = sv.gensym_types
-
-    for (li::LambdaStaticData) in closures
-        if !li.inferred
-            a = li.ast
-            # pass on declarations of captured vars
-            for vi in a.args[2][2]::Array{Any,1}
-                if (vi[3]&4)==0
-                    vi[2] = get(decls, vi[1], vi[2])
-                end
-            end
-            # NOTE: this is disabled, as it leads to inlining too early.
-            # See issue #4688. We should wait until inner functions are called
-            # to optimize them; this will be done by the method cache or
-            # builtins.c:jl_trampoline. However if jl_trampoline is changed then
-            # this code will need to be restored.
-            #na = length(a.args[1])
-            #li.ast, _ = typeinf(li, ntuple(i->(i>na ? (Tuple)[1] : Any), na+1),
-            #                    li.sparams, li, false)
-        end
-    end
 
     return ast
 end
@@ -1963,8 +1859,6 @@ function exprtype(x::ANY, sv::StaticVarInfo)
         return typeof(v)
     elseif isa(x,Type)
         return Type{x}
-    elseif isa(x,LambdaStaticData)
-        return Function
     elseif isa(x,GlobalRef)
         return abstract_eval_global(x.mod, (x::GlobalRef).name)
     else
@@ -2002,14 +1896,14 @@ end
 function effect_free(e::ANY, sv, allow_volatile::Bool)
     if isa(e,SymbolNode)
         allow_volatile && return true
-        if is_assigned_inner(sv, (e::SymbolNode).name) || is_global(sv, (e::SymbolNode).name)
+        if is_global(sv, (e::SymbolNode).name)
             return false
         end
         return true
     end
     if isa(e,Symbol)
         allow_volatile && return true
-        if is_assigned_inner(sv, e::Symbol) || is_global(sv, e::Symbol)
+        if is_global(sv, e::Symbol)
             return false
         end
         return true
@@ -2114,11 +2008,8 @@ end
 # static parameters are ok if all the static parameter values are leaf types,
 # meaning they are fully known.
 function inlineable(f::ANY, e::Expr, atype::ANY, sv::StaticVarInfo, enclosing_ast::Expr)
-    if !(isa(f,Function) || isa(f,IntrinsicFunction))
-        return NF
-    end
     atypes = atype.parameters
-    argexprs = e.args[2:end]
+    argexprs = copy(e.args)
 
     if is(f, typeassert) && length(atypes)==2
         # typeassert(x::S, T) => x, when S<:T
@@ -2133,7 +2024,7 @@ function inlineable(f::ANY, e::Expr, atype::ANY, sv::StaticVarInfo, enclosing_as
     end
     topmod = _topmod()
     if istopfunction(topmod, f, :isbits) && length(atypes)==1 && isType(atypes[1]) &&
-        effect_free(argexprs[1],sv,true) && isleaftype(atypes[1].parameters[1])
+        effect_free(argexprs[2],sv,true) && isleaftype(atypes[1].parameters[1])
         return (isbits(atypes[1].parameters[1]),())
     end
     # special-case inliners for known pure functions that compute types
@@ -2156,8 +2047,9 @@ function inlineable(f::ANY, e::Expr, atype::ANY, sv::StaticVarInfo, enclosing_as
     meth = meth[1]::SimpleVector
 
     local linfo
+    fatype = Tuple{abstract_eval_constant(f), atypes...}
     linfo = try
-        func_for_method(meth[3],atype,meth[2])
+        func_for_method(meth[3],fatype,meth[2])
     catch
         NF
     end
@@ -2192,10 +2084,6 @@ function inlineable(f::ANY, e::Expr, atype::ANY, sv::StaticVarInfo, enclosing_as
     #     end
     # end
 
-    if !isa(linfo,LambdaStaticData) || length(meth[3].func.env) > 0
-        return NF
-    end
-
     sp = meth[2]::SimpleVector
     sp = svec(sp..., linfo.sparams...)
     spvals = Any[ sp[i] for i in 2:2:length(sp) ]
@@ -2212,7 +2100,7 @@ function inlineable(f::ANY, e::Expr, atype::ANY, sv::StaticVarInfo, enclosing_as
     metharg = meth[1]::Type
     methargs = metharg.parameters
     nm = length(methargs)
-    if !(atype <: metharg)
+    if !(fatype <: metharg)
         incompletematch = true
         if !inline_incompletematch_allowed || !isdefined(Main,:Base)
             # provide global disable if this optimization is not desirable
@@ -2234,12 +2122,6 @@ function inlineable(f::ANY, e::Expr, atype::ANY, sv::StaticVarInfo, enclosing_as
     end
     ast = ast::Expr
     vinflist = ast.args[2][1]::Array{Any,1}
-    for vi in vinflist
-        if (vi[3]&1)!=0
-            # captures variables (TODO)
-            return NF
-        end
-    end
 
     body = Expr(:block)
     body.args = filter(x->!((isa(x,Expr) && is(x.head,:line)) || isa(x,LineNumberNode)),
@@ -2251,7 +2133,7 @@ function inlineable(f::ANY, e::Expr, atype::ANY, sv::StaticVarInfo, enclosing_as
     if is(f, next) || is(f, done) || is(f, unsafe_convert) || is(f, cconvert)
         cost ÷= 4
     end
-    inline_op = (f===(+) || f===(*) || f===min || f===max) && (3 <= length(argexprs) <= 9) &&
+    inline_op = (f===(+) || f===(*) || f===min || f===max) && (4 <= length(argexprs) <= 10) &&
         meth[3].sig == Tuple{Any,Any,Any,Vararg{Any}}
     if !inline_op && !inline_worthy(body, cost)
         if incompletematch
@@ -2746,15 +2628,6 @@ function inlining_pass(e::Expr, sv, ast)
     if !is(f,false)
         f = _ieval(f)
     end
-    if (!isa(f,Function) && !isa(f,IntrinsicFunction) &&
-        (f1 !== false || typeintersect(exprtype(arg1,sv), Function) === Bottom))
-        modu = (inference_stack::CallStack).mod
-        if !_iisdefined(:call)
-            return (e,stmts)
-        end
-        f = _ieval(:call)
-        e.args = Any[is_global(sv,:call) ? (:call) : GlobalRef(modu, :call), e.args...]
-    end
 
     if isdefined(Main, :Base) &&
         ((isdefined(Main.Base, :^) && is(f, Main.Base.(:^))) ||
@@ -2805,25 +2678,25 @@ function inlining_pass(e::Expr, sv, ast)
 
         if is(f,_apply)
             na = length(e.args)
-            newargs = cell(na-3)
-            for i = 4:na
+            newargs = cell(na-2)
+            for i = 3:na
                 aarg = e.args[i]
                 t = exprtype(aarg,sv)
                 if isa(aarg,Expr) && (is_known_call(aarg, tuple, sv) || is_known_call(aarg, svec, sv))
                     # apply(f,tuple(x,y,...)) => f(x,y,...)
-                    newargs[i-3] = aarg.args[2:end]
+                    newargs[i-2] = aarg.args[2:end]
                 elseif isa(aarg, Tuple)
-                    newargs[i-3] = Any[ QuoteNode(x) for x in aarg ]
+                    newargs[i-2] = Any[ QuoteNode(x) for x in aarg ]
                 elseif (t<:Tuple) && !isvatuple(t) && effect_free(aarg,sv,true)
                     # apply(f,t::(x,y)) => f(t[1],t[2])
                     tp = t.parameters
-                    newargs[i-3] = Any[ mk_getfield(aarg,j,tp[j]) for j=1:length(tp) ]
+                    newargs[i-2] = Any[ mk_getfield(aarg,j,tp[j]) for j=1:length(tp) ]
                 else
                     # not all args expandable
                     return (e,stmts)
                 end
             end
-            e.args = [Any[e.args[3]]; newargs...]
+            e.args = [Any[e.args[2]]; newargs...]
 
             # now try to inline the simplified call
             f = isconstantfunc(e.args[1], sv)
@@ -2915,7 +2788,7 @@ function is_known_call(e::Expr, func, sv)
     return !is(f,false) && is(_ieval(f), func)
 end
 
-function is_known_call_p(e::Expr, pred::Function, sv)
+function is_known_call_p(e::Expr, pred, sv)
     if e.head !== :call
         return false
     end

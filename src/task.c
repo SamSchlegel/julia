@@ -873,7 +873,7 @@ DLLEXPORT jl_task_t *jl_new_task(jl_function_t *start, size_t ssize)
 
     init_task(t);
     JL_GC_POP();
-    jl_gc_add_finalizer((jl_value_t*)t, jl_unprotect_stack_func);
+    //jl_gc_add_finalizer((jl_value_t*)t, jl_unprotect_stack_func);
 #endif
 
     return t;
@@ -920,7 +920,7 @@ void jl_init_tasks(void)
                                             jl_any_type, jl_sym_type,
                                             jl_any_type, jl_any_type,
                                             jl_any_type, jl_any_type,
-                                            jl_any_type, jl_function_type),
+                                            jl_any_type, jl_any_type),
                                    0, 1, 0);
     jl_svecset(jl_task_type->types, 0, (jl_value_t*)jl_task_type);
 
@@ -928,7 +928,7 @@ void jl_init_tasks(void)
     failed_sym = jl_symbol("failed");
     runnable_sym = jl_symbol("runnable");
 
-    jl_unprotect_stack_func = jl_new_closure(jl_unprotect_stack, (jl_value_t*)jl_emptysvec, NULL);
+    //jl_unprotect_stack_func = jl_new_closure(jl_unprotect_stack, (jl_value_t*)jl_emptysvec, NULL);
 }
 
 // Initialize a root task using the given stack.

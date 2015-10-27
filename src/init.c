@@ -162,7 +162,7 @@ DLLEXPORT void jl_atexit_hook(int exitcode)
         jl_write_malloc_log();
     if (jl_base_module) {
         jl_value_t *f = jl_get_global(jl_base_module, jl_symbol("_atexit"));
-        if (f!=NULL && jl_is_function(f)) {
+        if (f != NULL) {
             JL_TRY {
                 jl_apply((jl_function_t*)f, NULL, 0);
             }
@@ -663,8 +663,6 @@ jl_function_t *jl_typeinf_func=NULL;
 
 DLLEXPORT void jl_set_typeinf_func(jl_value_t* f)
 {
-    if (!jl_is_function(f))
-        jl_error("jl_set_typeinf_func must set a jl_function_t*");
     jl_typeinf_func = (jl_function_t*)f;
 }
 

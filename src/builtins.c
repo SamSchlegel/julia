@@ -389,20 +389,10 @@ static jl_function_t *jl_append_any_func;
 
 JL_CALLABLE(jl_f_apply)
 {
-    JL_NARGSV(apply, 2);
-    jl_function_t *f;
-    jl_function_t *call_func = (jl_function_t*)args[0];
-    assert(jl_is_function(call_func));
-    if (jl_is_function(args[1])) {
-        f = (jl_function_t*)args[1];
-        --nargs; ++args; /* args[1] becomes args[0] */
-    }
-    else { /* do generic call(args...) instead */
-        f = call_func;
-        // protect "function" arg from splicing
-        args[1] = (jl_value_t*)jl_svec1(args[1]);
-    }
+    JL_NARGSV(apply, 1);
+    jl_function_t *f = args[0];
     if (nargs == 2) {
+        /* TODO jb/functions
         if (f->fptr == &jl_f_svec) {
             if (jl_is_svec(args[1]))
                 return args[1];
@@ -417,6 +407,7 @@ JL_CALLABLE(jl_f_apply)
                 return (jl_value_t*)t;
             }
         }
+        */
         if (jl_is_svec(args[1])) {
             return jl_apply(f, jl_svec_data(args[1]), jl_svec_len(args[1]));
         }
@@ -491,48 +482,34 @@ JL_CALLABLE(jl_f_apply)
 
 JL_CALLABLE(jl_f_kwcall)
 {
-    if (nargs < 4)
+    if (nargs < 3)
         jl_error("internal error: malformed keyword argument call");
-    jl_function_t *f;
-    jl_function_t *call_func = (jl_function_t*)args[0];
-    assert(jl_is_function(call_func));
-    size_t nkeys = jl_unbox_long(args[1]);
-    size_t pa = 4 + 2*nkeys;
-    jl_array_t *container = (jl_array_t*)args[pa-1];
+    size_t nkeys = jl_unbox_long(args[0]);
+    size_t pa = 3 + 2*nkeys;
+    jl_array_t *container = (jl_array_t*)args[pa-2];
     assert(jl_array_len(container) > 0);
-    f = (jl_function_t*)args[pa-2];
-    if (!jl_is_function(f)) {
-        // do generic call(args...; kws...) instead
-        // switch (f container pa...) to (container f pa...)
-        args[pa-2] = args[pa-1];     // TODO: this might not be safe
-        args[pa-1] = (jl_value_t*)f;
-        f = call_func;
-        pa--;
-    }
+    jl_function_t *f = (jl_function_t*)args[pa-1];
 
-    if (!jl_is_gf(f))
-        jl_exceptionf(jl_argumenterror_type, "function does not accept keyword arguments");
-    jl_function_t *sorter = ((jl_methtable_t*)f->env)->kwsorter;
+    jl_function_t *sorter = jl_gf_mtable(f)->kwsorter;
     if (sorter == NULL) {
         jl_exceptionf(jl_argumenterror_type, "function %s does not accept keyword arguments",
                       jl_gf_name(f)->name);
     }
 
     for(size_t i=0; i < nkeys*2; i+=2) {
-        jl_cellset(container, i  , args[2+i]);
-        jl_cellset(container, i+1, args[2+i+1]);
+        jl_cellset(container, i  , args[1+i]);
+        jl_cellset(container, i+1, args[1+i+1]);
     }
 
-    args += pa-1;
-    nargs -= pa-1;
-    assert(jl_is_gf(sorter));
-    jl_function_t *m = jl_method_lookup((jl_methtable_t*)sorter->env, args, nargs, 1);
-    if (m == jl_bottom_func) {
-        jl_no_method_error(f, args+1, nargs-1);
+    args += pa-2;
+    nargs -= pa-2;
+    jl_lambda_info_t *m = jl_method_lookup(jl_gf_mtable(sorter), args, nargs, 1);
+    if (m == NULL) {
+        jl_no_method_error(f, args+2, nargs-2);
         // unreachable
     }
 
-    return jl_apply(m, args, nargs);
+    return jl_call_method_internal(m, args, nargs);
 }
 
 // eval -----------------------------------------------------------------------
@@ -958,75 +935,6 @@ void jl_show(jl_value_t *stream, jl_value_t *v)
 
 // internal functions ---------------------------------------------------------
 
-extern int jl_in_inference;
-extern int jl_boot_file_loaded;
-int jl_eval_with_compiler_p(jl_expr_t *ast, jl_expr_t *expr, int compileloops, jl_module_t *m);
-
-static int jl_eval_inner_with_compiler(jl_expr_t *e, jl_module_t *m)
-{
-    int i;
-    for(i=0; i < jl_array_len(e->args); i++) {
-        jl_value_t *ei = jl_exprarg(e,i);
-        if (jl_is_lambda_info(ei)) {
-            jl_lambda_info_t *li = (jl_lambda_info_t*)ei;
-            if (!jl_is_expr(li->ast)) {
-                li->ast = jl_uncompress_ast(li, li->ast);
-                jl_gc_wb(li, li->ast);
-            }
-            jl_expr_t *a = (jl_expr_t*)li->ast;
-            if (jl_lam_capt(a)->length > 0 && jl_eval_with_compiler_p(a, jl_lam_body(a), 1, m))
-                return 1;
-        }
-        if (jl_is_expr(ei) && jl_eval_inner_with_compiler((jl_expr_t*)ei, m))
-            return 1;
-    }
-    return 0;
-}
-
-void jl_trampoline_compile_function(jl_function_t *f, int always_infer, jl_tupletype_t *sig)
-{
-    assert(sig);
-    assert(f->linfo != NULL);
-    // to run inference on all thunks. slows down loading files.
-    // NOTE: if this call to inference is removed, type_annotate in inference.jl
-    // needs to be updated to infer inner functions.
-    if (f->linfo->inferred == 0) {
-        if (!jl_in_inference) {
-            if (!jl_is_expr(f->linfo->ast)) {
-                f->linfo->ast = jl_uncompress_ast(f->linfo, f->linfo->ast);
-                jl_gc_wb(f->linfo, f->linfo->ast);
-            }
-            assert(jl_is_expr(f->linfo->ast));
-            if (always_infer ||
-                jl_eval_with_compiler_p((jl_expr_t*)f->linfo->ast, jl_lam_body((jl_expr_t*)f->linfo->ast), 1, f->linfo->module) ||
-                // if this function doesn't need to be compiled, but contains inner
-                // functions that do and that capture variables, we need to run
-                // inference on the whole thing to propagate types into the inner
-                // functions. caused issue #12794
-                jl_eval_inner_with_compiler(jl_lam_body((jl_expr_t*)f->linfo->ast), f->linfo->module)) {
-                jl_type_infer(f->linfo, sig, f->linfo);
-            }
-        }
-    }
-    jl_compile(f);
-    // this assertion is probably not correct; the fptr could have been assigned
-    // by a recursive invocation from inference above.
-    //assert(f->fptr == &jl_trampoline);
-    jl_generate_fptr(f);
-    if (jl_boot_file_loaded && jl_is_expr(f->linfo->ast)) {
-        f->linfo->ast = jl_compress_ast(f->linfo, f->linfo->ast);
-        jl_gc_wb(f->linfo, f->linfo->ast);
-    }
-}
-
-JL_CALLABLE(jl_trampoline)
-{
-    assert(jl_is_func(F));
-    jl_function_t *f = (jl_function_t*)F;
-    jl_trampoline_compile_function(f, 0, f->linfo->specTypes ? f->linfo->specTypes : jl_anytuple_type);
-    return jl_apply(f, args, nargs);
-}
-
 JL_CALLABLE(jl_f_instantiate_type)
 {
     JL_NARGSV(instantiate_type, 1);
@@ -1056,9 +964,9 @@ static void jl_check_type_tuple(jl_value_t *t, jl_sym_t *name, const char *ctx)
 JL_CALLABLE(jl_f_methodexists)
 {
     JL_NARGS(method_exists, 2, 2);
-    JL_TYPECHK(method_exists, function, args[0]);
-    if (!jl_is_gf(args[0]))
-        jl_error("method_exists: not a generic function");
+    //JL_TYPECHK(method_exists, function, args[0]);
+    //if (!jl_is_gf(args[0]))
+    //    jl_error("method_exists: not a generic function");
     jl_value_t *argtypes = args[1];
     JL_GC_PUSH1(&argtypes);
     if (jl_is_tuple(args[1])) {
@@ -1070,7 +978,7 @@ JL_CALLABLE(jl_f_methodexists)
         jl_check_type_tuple(args[1], jl_gf_name(args[0]), "method_exists");
     }
     jl_value_t *res = jl_method_lookup_by_type(jl_gf_mtable(args[0]),
-                                               (jl_tupletype_t*)argtypes,0,0)!=jl_bottom_func ?
+                                               (jl_tupletype_t*)argtypes,0,0) != NULL ?
         jl_true : jl_false;
     JL_GC_POP();
     return res;
@@ -1079,20 +987,13 @@ JL_CALLABLE(jl_f_methodexists)
 JL_CALLABLE(jl_f_applicable)
 {
     JL_NARGSV(applicable, 1);
-    JL_TYPECHK(applicable, function, args[0]);
-    if (!jl_is_gf(args[0]))
-        jl_error("applicable: not a generic function");
-    return jl_method_lookup(jl_gf_mtable(args[0]),
-                            &args[1], nargs-1, 1) != jl_bottom_func ?
+    return jl_method_lookup(jl_gf_mtable(args[0]), args, nargs, 1) != NULL ?
         jl_true : jl_false;
 }
 
 JL_CALLABLE(jl_f_invoke)
 {
     JL_NARGSV(invoke, 2);
-    JL_TYPECHK(invoke, function, args[0]);
-    if (!jl_is_gf(args[0]))
-        jl_error("invoke: not a generic function");
     jl_value_t *argtypes = args[1];
     JL_GC_PUSH1(&argtypes);
     if (jl_is_tuple(args[1])) {
@@ -1105,8 +1006,8 @@ JL_CALLABLE(jl_f_invoke)
     }
     if (!jl_tuple_subtype(&args[2], nargs-2, (jl_datatype_t*)argtypes, 1))
         jl_error("invoke: argument type error");
-    jl_value_t *res = jl_gf_invoke((jl_function_t*)args[0],
-                                   (jl_tupletype_t*)argtypes, &args[2], nargs-2);
+    args[1] = args[0];  // move function directly in front of arguments
+    jl_value_t *res = jl_gf_invoke((jl_tupletype_t*)argtypes, &args[1], nargs-1);
     JL_GC_POP();
     return res;
 }
@@ -1210,10 +1111,25 @@ static void add_builtin(const char *name, jl_value_t *v)
     jl_set_const(jl_core_module, jl_symbol(name), v);
 }
 
-static void add_builtin_func(const char *name, jl_fptr_t f)
+jl_lambda_info_t *jl_method_cache_insert(jl_methtable_t *mt, jl_tupletype_t *type,
+                                         jl_lambda_info_t *method);
+
+static jl_value_t *mk_builtin_func(const char *name, jl_fptr_t fptr)
 {
-    add_builtin(name, (jl_value_t*)
-                jl_new_closure(f, (jl_value_t*)jl_symbol(name), NULL));
+    jl_datatype_t *ftype = jl_new_datatype(jl_symbol(name), jl_builtin_type, jl_emptysvec,
+                                           jl_emptysvec, jl_emptysvec, 0, 0, 0);
+    jl_value_t *f = jl_new_struct(ftype);
+    ftype->instance = f; jl_gc_wb(ftype, f);
+    // TODO jb/functions: what should li->ast be?
+    jl_lambda_info_t *li = jl_new_lambda_info(jl_nothing, jl_emptysvec, jl_core_module);
+    li->fptr = fptr;
+    jl_method_cache_insert(jl_gf_mtable(f), jl_anytuple_type, li);
+    return f;
+}
+
+static void add_builtin_func(const char *name, jl_fptr_t fptr)
+{
+    add_builtin(name, mk_builtin_func(name, fptr));
 }
 
 void jl_init_primitives(void)
@@ -1271,6 +1187,7 @@ void jl_init_primitives(void)
     add_builtin("GenSym", (jl_value_t*)jl_gensym_type);
     add_builtin("IntrinsicFunction", (jl_value_t*)jl_intrinsic_type);
     add_builtin("Function", (jl_value_t*)jl_function_type);
+    add_builtin("Builtin", (jl_value_t*)jl_builtin_type);
     add_builtin("LambdaStaticData", (jl_value_t*)jl_lambda_info_type);
     add_builtin("Ref", (jl_value_t*)jl_ref_type);
     add_builtin("Ptr", (jl_value_t*)jl_pointer_type);
@@ -1379,14 +1296,6 @@ size_t jl_static_show_x(JL_STREAM *out, jl_value_t *v, int depth)
             else if (jl_is_tuple_type(dv)) {
                 n += jl_printf(out, "{}");
             }
-        }
-    }
-    else if (jl_is_func(v)) {
-        if (jl_is_gf(v)) {
-            n += jl_printf(out, "%s", jl_gf_name(v)->name);
-        }
-        else {
-            n += jl_printf(out, "#<function>");
         }
     }
     else if (jl_typeis(v, jl_intrinsic_type)) {
